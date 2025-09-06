@@ -14,11 +14,10 @@ This file:
  - Fixes shape / hardcoded-size bugs in the DQN network
  - Adds robust guards for missing patterns/spatial maps
  - Adds safety gating for stimulation
- - Adds a simulation-only fallback if `cl` SDK is unavailable (so you can test without hardware)
+ - Adds a simulation-only fallback if `cl` SDK unavailable (so you can test without hardware)
  - Saves normalization statistics with spike datasets and uses them at runtime
  - Provides clearer logging and runtime checks
-
-NOTE: This script *interfaces with hardware SDKs (cl)*. Keep it in a controlled environment.
+ - Adds distance-shaped reward and visualization hooks (distance traces & automap snapshots)
 """
 
 from __future__ import annotations
@@ -59,7 +58,6 @@ try:
 except Exception:
     CL_AVAILABLE = False
 
-
     # Minimal simulation stub for development/testing without hardware.
     class _DummyTick:
         class _Analysis:
@@ -68,7 +66,6 @@ except Exception:
 
         def __init__(self):
             self.analysis = _DummyTick._Analysis()
-
 
     class DummyStimPlan:
         def __init__(self):
@@ -82,7 +79,6 @@ except Exception:
 
         def run(self):
             return
-
 
     class DummyNeurons:
         def __enter__(self):
@@ -105,22 +101,18 @@ except Exception:
         def __repr__(self):
             return "<DummyNeurons simulation>"
 
-
     # Minimal Dummy classes for ChannelSet, StimDesign, BurstDesign for compatibility
     class DummyChannelSet(tuple):
         def __new__(cls, *args):
             return tuple.__new__(cls, args)
 
-
     class DummyStimDesign:
         def __init__(self, *args, **kwargs):
             pass
 
-
     class DummyBurstDesign:
         def __init__(self, *args, **kwargs):
             pass
-
 
     # Attach to fake "cl" namespace so code below can reference cl.* safely
     import types
@@ -590,6 +582,145 @@ def graded_feedback_plan(neurons: Neurons, magnitude: float = 1.0, positive: boo
 
 
 # -------------------------
+# Distance-shaped reward helpers
+# -------------------------
+def get_player_and_armor_positions(state: Optional[GameState]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Return (player_xy, armor_xy) or (None, None) if not available."""
+    if state is None:
+        return None, None
+    try:
+        guy = np.array(state.game_variables[2:4], dtype=np.float32)
+        armor_obj = next((o for o in state.objects if getattr(o, "name", "") == "GreenArmor"), None)
+        if armor_obj is None:
+            return guy, None
+        armor = np.array([armor_obj.position_x, armor_obj.position_y], dtype=np.float32)
+        return guy, armor
+    except Exception:
+        return None, None
+
+
+def armor_distance(state: Optional[GameState], max_distance: float = 200.0) -> Optional[float]:
+    """Clipped Euclidean distance to GreenArmor, or None if not present."""
+    guy, armor = get_player_and_armor_positions(state)
+    if guy is None or armor is None:
+        return None
+    d = float(np.linalg.norm(guy - armor))
+    return min(d, max_distance)
+
+
+class DistanceReward:
+    """
+    Positive reward for moving closer to GreenArmor; negative for moving away.
+    Smooth, clipped, and scaleable; also adds a one-time pickup bonus.
+    """
+    def __init__(self, scale: float = 0.05, pickup_bonus: float = 50.0, max_distance: float = 200.0):
+        self.prev_distance: Optional[float] = None
+        self.scale = float(scale)
+        self.pickup_bonus = float(pickup_bonus)
+        self.max_distance = float(max_distance)
+        self.prev_had_armor: Optional[bool] = None
+
+    def start_episode(self):
+        self.prev_distance = None
+        self.prev_had_armor = None
+
+    def step(self, state_before: Optional[GameState], state_after: Optional[GameState]) -> float:
+        # detect armor presence for pickup bonus
+        def has_armor(st: Optional[GameState]) -> bool:
+            if st is None:
+                return False
+            try:
+                return any(getattr(o, "name", "") == "GreenArmor" for o in st.objects)
+            except Exception:
+                return False
+
+        r = 0.0
+        d_before = armor_distance(state_before, self.max_distance)
+        d_after  = armor_distance(state_after,  self.max_distance)
+
+        # shaped reward on distance delta (if both distances are known)
+        if d_before is not None and d_after is not None:
+            delta = d_before - d_after  # positive if we moved closer
+            # small, smooth reward; clip to avoid explosions
+            r += self.scale * float(np.clip(delta, -10.0, 10.0))
+
+        # pickup bonus when armor disappears from object list
+        now_has = has_armor(state_after)
+        was_has = has_armor(state_before)
+        if was_has and not now_has:
+            r += self.pickup_bonus
+
+        self.prev_distance = d_after
+        self.prev_had_armor = now_has
+        return r
+
+
+# -------------------------
+# Per-action neural feedback hooks (safe-gated)
+# -------------------------
+def per_action_feedback(neurons: Neurons, reward: float, allow_stim: bool):
+    if not allow_stim:
+        return
+    try:
+        plan = neurons.create_stim_plan()
+        plan.interrupt(feedback_channels_set)
+        magnitude = float(np.clip(abs(reward), 0.0, 1.0))
+        burst = _make_burst_design(int(10 + 60 * magnitude), int(80 + 120 * magnitude))
+        if reward >= 0.0:
+            plan.stim(feedback_channels_set, stim_design, burst)
+        else:
+            # stagger channels slightly for negative feedback
+            for i, ch in enumerate(feedback_channels):
+                plan.stim(cl.ChannelSet(ch), stim_design, _make_burst_design(int(5 + 40 * magnitude), 140 + 20 * i))
+        plan.run()
+    except Exception:
+        pass
+
+
+def end_of_episode_feedback(neurons: Neurons, episode_score: float, allow_stim: bool):
+    if not allow_stim:
+        return
+    try:
+        magnitude = min(1.0, max(0.0, episode_score / 100.0))
+        plan = graded_feedback_plan(neurons, magnitude=magnitude, positive=(episode_score >= 0))
+        plan.run()
+    except Exception:
+        pass
+
+
+# -------------------------
+# Visualization helpers
+# -------------------------
+def log_distance_trace(distances: List[Optional[float]], save_path: str, ep_idx: int):
+    xs = list(range(len(distances)))
+    ys = [d if (d is not None) else np.nan for d in distances]
+    try:
+        plt.figure(figsize=(6,3))
+        plt.plot(xs, ys, linewidth=1.5)
+        plt.title(f"Distance to GreenArmor — Episode {ep_idx}")
+        plt.xlabel("tick"); plt.ylabel("distance (clipped)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, f"distance_ep{ep_idx}.png"))
+        plt.close()
+    except Exception:
+        pass
+
+
+def save_automap_snapshot(game: DoomGame, save_path: str, ep_idx: int, step_idx: int):
+    try:
+        state = game.get_state()
+        if state is None or state.automap_buffer is None:
+            return
+        im = state.automap_buffer
+        # write a few snapshots per episode (every ~30 steps)
+        if step_idx % 30 == 0:
+            out = os.path.join(save_path, f"automap_ep{ep_idx}_t{step_idx}.png")
+            cv2.imwrite(out, im)
+    except Exception:
+        pass
+
+
+# -------------------------
 # Dataset collection using teacher
 # -------------------------
 def collect_spike_dataset(game: DoomGame, neurons: Neurons, teacher_agent: DQNAgent, target_samples: int = 3000,
@@ -750,15 +881,20 @@ def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decod
 
     while episodes_done < episodes:
         game.new_episode()
+        shaper = DistanceReward(scale=0.05, pickup_bonus=50.0, max_distance=200.0)
+        shaper.start_episode()
+
         spike_hist = deque(maxlen=window - 1)
         for _ in range(window - 1):
             spike_hist.append(np.zeros(len(action_channel_groups), dtype=np.float32))
-        total_reward = 0.0;
-        steps = 0;
-        rasters = [];
+
+        total_reward = 0.0
+        steps = 0
+        rasters = []
         latencies = []
-        agreement_counts = 0;
+        agreement_counts = 0
         teacher_checks = 0
+        dist_trace: List[Optional[float]] = []
 
         # In non-hardware mode we simulate spikes; in hardware mode we use neurons.loop
         if allow_stim:
@@ -779,19 +915,24 @@ def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decod
 
         for tick in loop_iter:
             t0 = perf_counter()
-            state = game.get_state()
+            state_before = game.get_state()
+            d_before = armor_distance(state_before)
+            if d_before is not None:
+                dist_trace.append(d_before)
+            else:
+                dist_trace.append(None)
 
             # encode or simulate
             if allow_stim:
                 # stimulatory encoding
-                encode_hybrid(neurons, state, plans, patterns, spatial_map)
+                encode_hybrid(neurons, state_before, plans, patterns, spatial_map)
                 feat, counts = extract_spike_features(tick.analysis.spikes, spike_hist)
                 spike_hist.append(counts)
             else:
                 # simulation: base correlated with teacher if available
                 num_groups = len(action_channel_groups)
-                if teacher is not None and state is not None:
-                    frame = preprocess(state.screen_buffer)
+                if teacher is not None and state_before is not None:
+                    frame = preprocess(state_before.screen_buffer)
                     t_act = teacher.get_action(frame)
                     base = np.ones(num_groups, dtype=np.float32) * 0.5
                     base[t_act % num_groups] += 4.0
@@ -817,24 +958,31 @@ def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decod
             game.set_action(action_vec);
             game.advance_action(FRAME_REPEAT)
 
-            rew = game.get_last_reward() if hasattr(game, "get_last_reward") else 0.0
-            total_reward += rew;
+            # (d) reward = env + distance shaping
+            state_after = game.get_state()
+            r_env = game.get_last_reward() if hasattr(game, "get_last_reward") else 0.0
+            r_shape = shaper.step(state_before, state_after)
+            rew = float(r_env) + float(r_shape)
+            total_reward += rew
             steps += 1
+
+            # optional per-action neurofeedback (safe-gated)
+            per_action_feedback(neurons, r_shape, allow_stim=allow_stim)
 
             lat_ms = (perf_counter() - t0) * 1000.0
             latencies.append(lat_ms)
 
             # teacher agreement
-            if teacher is not None and state is not None:
-                frame = preprocess(state.screen_buffer)
+            if teacher is not None and state_before is not None:
+                frame = preprocess(state_before.screen_buffer)
                 t_action = teacher.get_action(frame)
                 teacher_checks += 1
                 if t_action == act_idx:
                     agreement_counts += 1
 
             # online finetune
-            if online_finetune and teacher is not None and state is not None:
-                t_action = teacher.get_action(preprocess(state.screen_buffer))
+            if online_finetune and teacher is not None and state_before is not None:
+                t_action = teacher.get_action(preprocess(state_before.screen_buffer))
                 model = spike_decoder;
                 model.train()
                 xb_ft = xb;
@@ -843,11 +991,12 @@ def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decod
                 loss = nn.CrossEntropyLoss()(model(xb_ft), yb_ft)
                 opt.zero_grad();
                 loss.backward();
-                opt.step()
+                opt.step();
                 model.eval()
 
             if show_automap_flag:
                 show_automap(game)
+                save_automap_snapshot(game, save_path, episodes_done, steps)
 
             if game.is_episode_finished():
                 mean_lat = float(np.mean(latencies)) if latencies else 0.0
@@ -875,6 +1024,9 @@ def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decod
                 except Exception:
                     pass
 
+                # Save distance trace
+                log_distance_trace(dist_trace, save_path, episodes_done)
+
                 csv_writer.writerow(
                     [episodes_done, total_reward, steps, mean_lat, agreement if agreement is not None else "NA"])
                 csv_file.flush()
@@ -882,13 +1034,7 @@ def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decod
                 logger.info(
                     f"[RUN] Episode {episodes_done} score={total_reward:.2f} steps={steps} mean_latency_ms={mean_lat:.2f} agreement={agreement}")
                 # graded feedback at episode end (only if allow_stim)
-                if allow_stim:
-                    magnitude = min(1.0, max(0.0, total_reward / 100.0))
-                    try:
-                        plan = graded_feedback_plan(neurons, magnitude=magnitude, positive=(total_reward > 0))
-                        plan.run()
-                    except Exception as e:
-                        logger.warning(f"[RUN] failed to run graded feedback: {e}")
+                end_of_episode_feedback(neurons, total_reward, allow_stim=allow_stim)
                 # safety interrupt
                 try:
                     neurons.interrupt(stim_channels)
@@ -920,6 +1066,25 @@ def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decod
             plt.close()
         except Exception:
             pass
+
+    # montage of distances
+    try:
+        imgs = []
+        for i in range(episodes_done):
+            p = os.path.join(save_path, f"distance_ep{i}.png")
+            if os.path.exists(p):
+                imgs.append(cv2.imread(p))
+        if imgs:
+            h = max(im.shape[0] for im in imgs); w = max(im.shape[1] for im in imgs)
+            canvas = np.ones((h * len(imgs), w, 3), dtype=np.uint8) * 255
+            for idx, im in enumerate(imgs):
+                if im is None: continue
+                imr = cv2.resize(im, (w, h))
+                canvas[idx*h:(idx+1)*h, :w] = imr
+            cv2.imwrite(os.path.join(save_path, "distance_montage.png"), canvas)
+    except Exception:
+        pass
+
     logger.info(f"[RUN] Closed-loop finished. Logs saved to {save_path}")
 
 
@@ -962,6 +1127,7 @@ def main():
         args.run_closed_loop = True
         args.allow_stim = False
         args.train_dqn = False
+        args.show_automap_flag = True
 
     set_seed()
     ensure_dir(args.save_path)
@@ -997,6 +1163,14 @@ def main():
     game.set_mode(Mode.PLAYER)
     game.set_screen_format(vzd.ScreenFormat.GRAY8)
     game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
+
+    # Expose objects (needed for GreenArmor distance)
+    try:
+        game.set_labels_buffer_enabled(True)
+        game.set_objects_info_enabled(True)
+    except Exception:
+        pass
+
     game.init()
 
     n_buttons = game.get_available_buttons_size()
@@ -1006,28 +1180,41 @@ def main():
     # Build teacher DQN
     teacher = DQNAgent(action_size=3, device=device, load_model=args.load_dqn)
     if args.train_dqn:
-        logger.info("[DQN] Training teacher (this can be long).")
-        # build action vectors safely
-        actions = []
-        for a in range(3):
-            actions.append(safe_action_vector(a, n_buttons))
+        logger.info("[DQN] Training teacher (distance-shaped).")
+        actions = [safe_action_vector(a, n_buttons) for a in range(3)]
+        shaper = DistanceReward(scale=0.05, pickup_bonus=50.0, max_distance=200.0)
+
         for epoch in range(TRAIN_EPOCHS):
             logger.info(f"[DQN] epoch {epoch + 1}/{TRAIN_EPOCHS}")
             game.new_episode()
+            shaper.start_episode()
+
             for step in trange(LEARNING_STEPS_PER_EPOCH, leave=False):
-                state = preprocess(game.get_state().screen_buffer)
-                a = teacher.get_action(state)
-                r = game.make_action(actions[a], FRAME_REPEAT)
+                state_before = game.get_state()
+                s = preprocess(state_before.screen_buffer) if state_before else np.zeros((1, RESOLUTION[0], RESOLUTION[1]), dtype=np.float32)
+                a = teacher.get_action(s)
+
+                # Step environment with teacher-chosen action
+                r_env = game.make_action(actions[a], FRAME_REPEAT)
                 done = game.is_episode_finished()
-                next_state = preprocess(game.get_state().screen_buffer) if not done else np.zeros(
-                    (1, RESOLUTION[0], RESOLUTION[1]), dtype=np.float32)
-                teacher.store(state, a, r, next_state, done)
+                state_after = game.get_state() if not done else None
+
+                # Distance-shaped reward
+                r_shape = shaper.step(state_before, state_after)
+                r = float(r_env) + float(r_shape)
+
+                s2 = preprocess(state_after.screen_buffer) if (state_after is not None) else np.zeros((1, RESOLUTION[0], RESOLUTION[1]), dtype=np.float32)
+                teacher.store(s, a, r, s2, done)
                 teacher.train_step()
+
                 if done:
                     game.new_episode()
+                    shaper.start_episode()
+
             teacher.sync_target()
+
         torch.save(teacher.q_net.state_dict(), os.path.join(args.save_path, "dqn_teacher.pth"))
-        logger.info("[DQN] Teacher training complete.")
+        logger.info("[DQN] Teacher training complete with distance-shaped rewards.")
 
     # Open neurons (real or dummy)
     with Neurons() as neurons:

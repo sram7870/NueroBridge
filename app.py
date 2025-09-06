@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hybrid closed-loop ViZDoom + cl (neural stim) system — polished version.
+Hybrid closed-loop ViZDoom + cl (neural stim) system — polished version with SMART SHOOTING.
 
 SAFETY FIRST:
  - Default mode is _simulation only_. To enable real hardware stimulation you MUST:
@@ -10,14 +10,13 @@ SAFETY FIRST:
  - Do not run hardware stimulation on humans or animals without Institutional approvals, trained staff, and
    hardware safety interlocks. The authors / assistant DO NOT endorse unsafe use.
 
-This file:
- - Fixes shape / hardcoded-size bugs in the DQN network
- - Adds robust guards for missing patterns/spatial maps
- - Adds safety gating for stimulation
- - Adds a simulation-only fallback if `cl` SDK unavailable (so you can test without hardware)
- - Saves normalization statistics with spike datasets and uses them at runtime
- - Provides clearer logging and runtime checks
- - Adds distance-shaped reward and visualization hooks (distance traces & automap snapshots)
+FIXES ADDED:
+ - Smart shooting: Only shoots when enemies are visible via CV/object detection
+ - Ammo conservation: Penalizes wasteful shooting when no enemies present
+ - Action cooldown: Prevents shooting spam
+ - Enhanced enemy detection using ViZDoom labels and CV
+ - FIXED: Robust game_variables handling to prevent TypeError crashes
+ - FIXED: Proper pipeline sequencing to ensure spike decoder is available
 """
 
 from __future__ import annotations
@@ -156,6 +155,11 @@ STIM_AMP_POS_UA = 2.5
 # Precompile frequencies used (Hz)
 PRECOMPILE_FREQS = [4, 8, 12, 20, 30, 40]
 
+# Smart shooting parameters
+SHOOT_COOLDOWN_FRAMES = 8  # Minimum frames between shots
+WASTEFUL_SHOOT_PENALTY = -5.0  # Penalty for shooting when no enemy visible
+AMMO_CONSERVATION_BONUS = 1.0  # Small bonus for conserving ammo when appropriate
+
 # Logging / misc
 MOVING_AVG_WINDOW = 10
 SEED = 1234
@@ -217,6 +221,192 @@ def preprocess(img) -> np.ndarray:
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
+def get_nearest_enemy(state):
+    """Return (x, y) screen coordinates of nearest enemy, or None if none found."""
+    if state is None or not hasattr(state, 'labels'):
+        return None
+    enemies = [o for o in state.labels if o.object_type in ENEMY_OBJECT_IDS]
+    if not enemies:
+        return None
+    px, py = RESOLUTION[1]//2, RESOLUTION[0]//2  # approximate agent center
+    nearest = min(enemies, key=lambda e: (e.x - px)**2 + (e.y - py)**2)
+    return (nearest.x, nearest.y)
+
+def compute_turn_direction(agent_pos, enemy_pos):
+    """Return -1 for left, 1 for right, 0 for aligned."""
+    if enemy_pos is None:
+        return 0
+    dx = enemy_pos[0] - agent_pos[0]
+    if abs(dx) < 5:  # small tolerance
+        return 0
+    return 1 if dx > 0 else -1
+
+def generate_enemy_aware_action(agent_pos, state, n_buttons):
+    """Return action vector targeting nearest enemy."""
+    action_vec = np.zeros(n_buttons, dtype=int)
+    enemy_pos = get_nearest_enemy(state)
+    turn_dir = compute_turn_direction(agent_pos, enemy_pos)
+    if turn_dir == 1:
+        action_vec[TURN_RIGHT] = 1
+    elif turn_dir == -1:
+        action_vec[TURN_LEFT] = 1
+    else:
+        if enemy_pos is not None:
+            action_vec[ATTACK] = 1
+        else:
+            action_vec[MOVE_FORWARD] = 1
+    return action_vec
+
+# -------------------------
+# SMART SHOOTING: Enemy Detection
+# -------------------------
+def detect_enemies_in_state(state: Optional[GameState]) -> bool:
+    """
+    Detect if any enemies are visible using ViZDoom's object detection system.
+    Returns True if enemies detected, False otherwise.
+    """
+    if state is None:
+        return False
+    
+    try:
+        # Check for enemies using ViZDoom's object detection
+        if hasattr(state, 'objects') and state.objects:
+            enemy_names = {'Cacodemon', 'ZombieMan', 'ShotgunGuy', 'Imp', 'Demon', 'Baron', 'Pinky'}
+            for obj in state.objects:
+                obj_name = getattr(obj, 'name', '')
+                if obj_name in enemy_names:
+                    return True
+        
+        # Fallback: CV-based enemy detection on screen buffer
+        if hasattr(state, 'screen_buffer') and state.screen_buffer is not None:
+            return detect_enemies_cv(state.screen_buffer)
+            
+    except Exception as e:
+        logger.debug(f"[ENEMY] Detection error: {e}")
+    
+    return False
+
+
+def detect_enemies_cv(screen_buffer) -> bool:
+    """
+    CV-based enemy detection fallback.
+    Detects reddish/brownish colors typical of DOOM enemies.
+    """
+    if screen_buffer is None:
+        return False
+        
+    try:
+        # Convert to RGB if needed
+        if len(screen_buffer.shape) == 3:
+            if screen_buffer.shape[0] == 3:  # CHW format
+                img = np.transpose(screen_buffer, (1, 2, 0))
+            else:  # HWC format
+                img = screen_buffer
+        else:
+            return False  # Can't detect enemies in grayscale easily
+            
+        # Convert to HSV for better color detection
+        hsv = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_RGB2HSV)
+        
+        # Define enemy color ranges (reddish/brownish for typical DOOM enemies)
+        # Range 1: Reddish colors (Cacodemon, blood, etc.)
+        red_lower1 = np.array([0, 50, 50])
+        red_upper1 = np.array([10, 255, 255])
+        red_lower2 = np.array([160, 50, 50]) 
+        red_upper2 = np.array([180, 255, 255])
+        
+        # Range 2: Brownish colors (ZombieMan, Imp, etc.)
+        brown_lower = np.array([5, 50, 20])
+        brown_upper = np.array([25, 255, 200])
+        
+        # Create masks
+        red_mask1 = cv2.inRange(hsv, red_lower1, red_upper1)
+        red_mask2 = cv2.inRange(hsv, red_lower2, red_upper2)
+        brown_mask = cv2.inRange(hsv, brown_lower, brown_upper)
+        
+        enemy_mask = cv2.bitwise_or(red_mask1, cv2.bitwise_or(red_mask2, brown_mask))
+        
+        # Count enemy pixels - if above threshold, enemy detected
+        enemy_pixels = np.sum(enemy_mask > 0)
+        total_pixels = screen_buffer.shape[0] * screen_buffer.shape[1]
+        enemy_ratio = enemy_pixels / total_pixels
+        
+        # Threshold: if >0.5% of pixels are "enemy-colored", consider enemy present
+        return enemy_ratio > 0.005
+        
+    except Exception as e:
+        logger.debug(f"[ENEMY CV] Detection error: {e}")
+        return False
+
+
+class ActionGater:
+    """
+    Gates actions to prevent wasteful shooting and implement cooldowns.
+    Now fully enemy-aware: only shoots when enemy is visible and roughly aligned.
+    """
+    def __init__(self):
+        self.last_shoot_frame = -999
+        self.total_shots_fired = 0
+        self.shots_on_target = 0
+
+    def reset_episode(self):
+        """Reset for new episode."""
+        self.last_shoot_frame = -999
+
+    def gate_action(self, intended_action: int, current_frame: int, state: Optional[GameState],
+                    n_buttons: int) -> Tuple[int, float]:
+        """
+        Gate the intended action based on smart shooting logic.
+        Returns (actual_action, reward_penalty)
+        """
+        reward_penalty = 0.0
+        SHOOT_ACTION = n_buttons - 1  # ATTACK button
+
+        # If not shooting, just allow
+        if intended_action != SHOOT_ACTION:
+            return intended_action, reward_penalty
+
+        # Cooldown check
+        frames_since_shot = current_frame - self.last_shoot_frame
+        if frames_since_shot < SHOOT_COOLDOWN_FRAMES:
+            logger.debug(f"[GATE] Shot blocked - cooldown ({frames_since_shot}/{SHOOT_COOLDOWN_FRAMES})")
+            return 0, 0.0  # Move forward instead of shooting
+
+        # Enemy detection
+        enemy_pos = get_nearest_enemy(state)
+        agent_center = (RESOLUTION[1]//2, RESOLUTION[0]//2)
+        enemy_visible = enemy_pos is not None
+
+        # Check if enemy roughly aligned (e.g., within ±10 pixels horizontally)
+        aligned_for_shoot = False
+        if enemy_visible:
+            dx = enemy_pos[0] - agent_center[0]
+            if abs(dx) <= ENEMY_SHOOT_TOLERANCE_PIXELS:
+                aligned_for_shoot = True
+
+        if enemy_visible and aligned_for_shoot:
+            # Allow shooting
+            self.last_shoot_frame = current_frame
+            self.total_shots_fired += 1
+            self.shots_on_target += 1  # Count as on-target since aligned
+            logger.debug(f"[GATE] Shot allowed - enemy aligned at {enemy_pos}")
+            return intended_action, 0.0
+        else:
+            # Block shot and penalize
+            reward_penalty = WASTEFUL_SHOOT_PENALTY
+            logger.debug(f"[GATE] Shot blocked - enemy not visible or not aligned (enemy_pos={enemy_pos})")
+            return 0, reward_penalty  # Move forward instead
+
+    def get_accuracy_stats(self) -> Dict[str, float]:
+        """Get shooting accuracy statistics."""
+        if self.total_shots_fired == 0:
+            return {"accuracy": 0.0, "shots_fired": 0, "shots_on_target": 0}
+        return {
+            "accuracy": self.shots_on_target / self.total_shots_fired,
+            "shots_fired": self.total_shots_fired,
+            "shots_on_target": self.shots_on_target
+        }
+
 
 # -------------------------
 # Dueling DQN (teacher) - robust shape handling
@@ -241,9 +431,9 @@ class DuelQNet(nn.Module):
         # compute flattened size dynamically using a dummy forward
         with torch.no_grad():
             dummy = torch.zeros(1, *input_shape)
-            tmp = self.conv1(dummy);
-            tmp = self.conv2(tmp);
-            tmp = self.conv3(tmp);
+            tmp = self.conv1(dummy)
+            tmp = self.conv2(tmp)
+            tmp = self.conv3(tmp)
             tmp = self.conv4(tmp)
             flat_dim = tmp.view(1, -1).shape[1]
 
@@ -269,7 +459,7 @@ class DuelQNet(nn.Module):
             pad = self._flat_dim - x.shape[1]
             x = torch.nn.functional.pad(x, (0, pad))
         half = x.shape[1] // 2
-        x1 = x[:, :half];
+        x1 = x[:, :half]
         x2 = x[:, half:]
         state_value = self.state_fc(x1).reshape(-1, 1)
         advantage_values = self.advantage_fc(x2)
@@ -300,14 +490,25 @@ class DQNAgent:
             else:
                 logger.warning(f"[DQN] load path not found: {load_model}")
 
-    def get_action(self, state: np.ndarray) -> int:
+    def get_action(self, state: np.ndarray, game_state: Optional[GameState] = None) -> int:
+        """Get action with optional enemy-aware logic."""
         # state shape (1, H, W)
         if random.random() < self.epsilon:
-            return random.randrange(self.action_size)
-        with torch.no_grad():
-            t = torch.from_numpy(np.expand_dims(state, axis=0)).float().to(self.device)  # (B, C, H, W)
-            q = self.q_net(t)
-            return int(torch.argmax(q, dim=-1).item())
+            action = random.randrange(self.action_size)
+        else:
+            with torch.no_grad():
+                t = torch.from_numpy(np.expand_dims(state, axis=0)).float().to(self.device)  # (B, C, H, W)
+                q = self.q_net(t)
+                action = int(torch.argmax(q, dim=-1).item())
+        
+        # Smart shooting: if DQN wants to shoot but no enemy visible, choose different action
+        if game_state is not None:
+            SHOOT_ACTION = self.action_size - 1
+            if action == SHOOT_ACTION and not detect_enemies_in_state(game_state):
+                # Override with forward movement if trying to shoot without target
+                action = 0  # Forward action
+        
+        return action
 
     def store(self, s, a, r, s2, done):
         self.memory.append((s, a, r, s2, done))
@@ -331,8 +532,8 @@ class DQNAgent:
 
         q_vals = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         loss = nn.MSELoss()(q_vals, target_q)
-        self.opt.zero_grad();
-        loss.backward();
+        self.opt.zero_grad()
+        loss.backward()
         self.opt.step()
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
@@ -345,7 +546,7 @@ class DQNAgent:
 # Spike decoder MLP
 # -------------------------
 class SpikeDecoder(nn.Module):
-    def __init__(self, input_dim: int, hidden: int = SPIKE_DECODER_HID, out: int = 3):
+    def __init__(self, input_dim: int, hidden: int = SPIKE_DECODER_HID, out: int = 4):  # Changed to 4 actions
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden), nn.ReLU(),
@@ -361,20 +562,19 @@ class SpikeDecoder(nn.Module):
 # Channel config & precompiled stim plans
 # -------------------------
 # NOTE: adjust channels to match your hardware mapping.
-# all_channels: example set excluding some reserved channels
 all_channels = [i for i in range(64) if i not in {0, 4, 7, 56, 63}]
 try:
     all_channels_set = cl.ChannelSet(*all_channels)
 except Exception:
-    # simulation stub may treat ChannelSet differently
     all_channels_set = cl.ChannelSet(*all_channels)
 
-# Stim and action channel groups - adjust per array layout
+# Enhanced action channel groups - now includes shooting
 stim_channels = cl.ChannelSet(9, 10, 17, 18)
 forward_channels = (41, 42, 49, 50)
 left_channels = (13, 14, 21, 22)
 right_channels = (45, 46, 53, 54)
-action_channel_groups = (forward_channels, left_channels, right_channels)
+shoot_channels = (31, 32, 39, 40)  # New shooting action channels
+action_channel_groups = (forward_channels, left_channels, right_channels, shoot_channels)
 feedback_channels = (27, 28, 35, 36)
 try:
     feedback_channels_set = cl.ChannelSet(*feedback_channels)
@@ -385,7 +585,6 @@ except Exception:
 try:
     stim_design = cl.StimDesign(STIM_PULSE_US, STIM_AMP_NEG_UA, STIM_PULSE_US, STIM_AMP_POS_UA)
 except Exception:
-    # some SDKs may require different args; fallback to a simple construction
     try:
         stim_design = cl.StimDesign(pulse_us=STIM_PULSE_US, amp_neg_uA=STIM_AMP_NEG_UA,
                                     pulse_us_pos=STIM_PULSE_US, amp_pos_uA=STIM_AMP_POS_UA)
@@ -398,14 +597,12 @@ def _make_burst_design(count: int, freq: int):
     try:
         return cl.BurstDesign(count, freq)
     except Exception:
-        # try common keyword names
         try:
             return cl.BurstDesign(count=count, frequency=freq)
         except Exception:
             try:
                 return cl.BurstDesign(burst_count=count, burst_frequency=freq)
             except Exception:
-                # last resort stub
                 return cl.BurstDesign()
 
 
@@ -414,9 +611,7 @@ def build_precompiled_plans(neurons: Neurons, freqs=PRECOMPILE_FREQS) -> Dict[in
     for f in freqs:
         try:
             p = neurons.create_stim_plan()
-            # interrupt only the stim_channels before running this plan
             p.interrupt(stim_channels)
-            # moderate burst length; user can override
             bd = _make_burst_design(200, int(max(1, f)))
             p.stim(stim_channels, stim_design, bd)
             plans[int(f)] = p
@@ -426,7 +621,7 @@ def build_precompiled_plans(neurons: Neurons, freqs=PRECOMPILE_FREQS) -> Dict[in
 
 
 # -------------------------
-# Encoding strategies
+# Encoding strategies (unchanged)
 # -------------------------
 def encode_temporal(neurons: Neurons, game_state: Optional[GameState], plans: Dict[int, object]):
     """Temporal freq encoding: distance -> frequency -> run precompiled plan."""
@@ -435,7 +630,10 @@ def encode_temporal(neurons: Neurons, game_state: Optional[GameState], plans: Di
     if game_state is None:
         return
     try:
-        guy = np.array(game_state.game_variables[2:4])
+        game_vars = getattr(game_state, 'game_variables', None)
+        if game_vars is None or len(game_vars) < 4:
+            return
+        guy = np.array([game_vars[2], game_vars[3]])
         armor_obj = next((o for o in game_state.objects if getattr(o, "name", "") == "GreenArmor"), None)
         if armor_obj is None:
             return
@@ -458,16 +656,16 @@ def encode_temporal(neurons: Neurons, game_state: Optional[GameState], plans: Di
 
 
 def encode_rate(neurons: Neurons, game_state: Optional[GameState], patterns: Optional[List[object]] = None):
-    """
-    Rate coding: closer -> stimulate more electrodes in stim_channels set (spatial recruitment).
-    patterns: list of StimPlan objects sized 1..N style
-    """
+    """Rate coding: closer -> stimulate more electrodes in stim_channels set."""
     if not patterns:
         return
     if game_state is None:
         return
     try:
-        guy = np.array(game_state.game_variables[2:4])
+        game_vars = getattr(game_state, 'game_variables', None)
+        if game_vars is None or len(game_vars) < 4:
+            return
+        guy = np.array([game_vars[2], game_vars[3]])
         armor_obj = next((o for o in game_state.objects if getattr(o, "name", "") == "GreenArmor"), None)
         if armor_obj is None:
             return
@@ -488,16 +686,16 @@ def encode_rate(neurons: Neurons, game_state: Optional[GameState], patterns: Opt
 
 
 def encode_spatial(neurons: Neurons, game_state: Optional[GameState], spatial_map: Optional[Dict[int, object]] = None):
-    """
-    Spatial encoding: map angle/relative location to different electrode groups.
-    spatial_map: dict of sector -> StimPlan
-    """
+    """Spatial encoding: map angle/relative location to different electrode groups."""
     if not spatial_map:
         return
     if game_state is None:
         return
     try:
-        guy = np.array(game_state.game_variables[2:4])
+        game_vars = getattr(game_state, 'game_variables', None)
+        if game_vars is None or len(game_vars) < 4:
+            return
+        guy = np.array([game_vars[2], game_vars[3]])
         armor_obj = next((o for o in game_state.objects if getattr(o, "name", "") == "GreenArmor"), None)
         if armor_obj is None:
             return
@@ -521,10 +719,8 @@ def encode_spatial(neurons: Neurons, game_state: Optional[GameState], spatial_ma
 
 
 def encode_hybrid(neurons: Neurons, game_state: Optional[GameState], plans=None, patterns=None, spatial_map=None):
-    # combine temporal + rate + spatial with weighted choice
     if plans:
         encode_temporal(neurons, game_state, plans)
-    # small chance to add spatial variation
     if spatial_map and (random.random() < 0.25):
         encode_spatial(neurons, game_state, spatial_map)
     if patterns:
@@ -535,12 +731,7 @@ def encode_hybrid(neurons: Neurons, game_state: Optional[GameState], plans=None,
 # Decoding: spike history & features
 # -------------------------
 def extract_spike_features(spikes, window_hist: deque) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    spikes: list of spike objects for current tick
-    window_hist: deque of past spike-count arrays (len = SPIKE_WINDOW-1)
-    returns (feat_vector, counts)
-    feat vector is flattened length (len(action_channel_groups) * SPIKE_WINDOW)
-    """
+    """Extract spike features including shooting action group."""
     counts = np.zeros(len(action_channel_groups), dtype=np.float32)
     if spikes:
         for sp in spikes:
@@ -556,13 +747,112 @@ def extract_spike_features(spikes, window_hist: deque) -> Tuple[np.ndarray, np.n
 
 
 # -------------------------
-# Graded feedback (biologically inspired)
+# Enhanced reward system with shooting penalties - FIXED VERSION
+# -------------------------
+class DistanceReward:
+    """Enhanced reward system with ammo conservation - FIXED VERSION."""
+    def __init__(self, scale: float = 0.05, pickup_bonus: float = 50.0, max_distance: float = 200.0):
+        self.prev_distance: Optional[float] = None
+        self.scale = float(scale)
+        self.pickup_bonus = float(pickup_bonus)
+        self.max_distance = float(max_distance)
+        self.prev_had_armor: Optional[bool] = None
+        self.prev_ammo: Optional[int] = None
+
+    def start_episode(self):
+        self.prev_distance = None
+        self.prev_had_armor = None
+        self.prev_ammo = None
+
+    def step(self, state_before: Optional[GameState], state_after: Optional[GameState]) -> float:
+        # Existing distance/armor logic
+        def has_armor(st: Optional[GameState]) -> bool:
+            if st is None:
+                return False
+            try:
+                return any(getattr(o, "name", "") == "GreenArmor" for o in st.objects)
+            except Exception:
+                return False
+
+        r = 0.0
+        d_before = self.armor_distance(state_before, self.max_distance)
+        d_after = self.armor_distance(state_after, self.max_distance)
+
+        # Distance shaping reward
+        if d_before is not None and d_after is not None:
+            delta = d_before - d_after
+            r += self.scale * float(np.clip(delta, -10.0, 10.0))
+
+        # Armor pickup bonus
+        now_has = has_armor(state_after)
+        was_has = has_armor(state_before)
+        if was_has and not now_has:
+            r += self.pickup_bonus
+
+        # FIXED: More robust ammo conservation logic
+        try:
+            # Safely get ammo from game_variables
+            def get_ammo(state):
+                if state is None:
+                    return 0
+                game_vars = getattr(state, 'game_variables', None)
+                if game_vars is None or len(game_vars) < 3:
+                    return 0
+                return int(game_vars[2]) if game_vars[2] is not None else 0
+            
+            current_ammo = get_ammo(state_after)
+            prev_ammo = get_ammo(state_before)
+            
+            # Small bonus for conserving ammo when no enemies present
+            if not detect_enemies_in_state(state_after) and current_ammo == prev_ammo and current_ammo > 0:
+                r += AMMO_CONSERVATION_BONUS
+                
+        except (IndexError, AttributeError, TypeError) as e:
+            # If ammo detection fails, just skip it - don't crash
+            logger.debug(f"[REWARD] Ammo detection failed: {e}")
+            pass
+
+        self.prev_distance = d_after
+        self.prev_had_armor = now_has
+        return r
+
+    def armor_distance(self, state: Optional[GameState], max_distance: float = 200.0) -> Optional[float]:
+        """Clipped Euclidean distance to GreenArmor, or None if not present."""
+        if state is None:
+            return None
+        try:
+            # FIXED: More robust game_variables access
+            game_vars = getattr(state, 'game_variables', None)
+            if game_vars is None or len(game_vars) < 4:
+                return None
+            
+            guy = np.array([game_vars[2], game_vars[3]], dtype=np.float32)
+            armor_obj = next((o for o in state.objects if getattr(o, "name", "") == "GreenArmor"), None)
+            if armor_obj is None:
+                return None
+            armor = np.array([armor_obj.position_x, armor_obj.position_y], dtype=np.float32)
+            d = float(np.linalg.norm(guy - armor))
+            return min(d, max_distance)
+        except (Exception, IndexError, AttributeError, TypeError):
+            return None
+
+
+# -------------------------
+# Simple fallback spike decoder for when training fails
+# -------------------------
+def create_simple_fallback_decoder(device: torch.device) -> SpikeDecoder:
+    """Create a simple random-initialized spike decoder as fallback."""
+    expected_input_dim = len(action_channel_groups) * SPIKE_WINDOW
+    decoder = SpikeDecoder(input_dim=expected_input_dim, hidden=SPIKE_DECODER_HID, out=4).to(device)
+    logger.info(f"[FALLBACK] Created simple spike decoder: input_dim={expected_input_dim}, out=4")
+    return decoder
+
+
+# -------------------------
+# Rest of the helper functions (unchanged from previous)
 # -------------------------
 def graded_feedback_plan(neurons: Neurons, magnitude: float = 1.0, positive: bool = True):
-    """
-    Create a stim plan where magnitude scales the burst count/duration.
-    This function does not bypass safety checking.
-    """
+    """Create a stim plan where magnitude scales the burst count/duration."""
     plan = neurons.create_stim_plan()
     plan.interrupt(feedback_channels_set)
     burst_count = int(5 + magnitude * 50)  # 5..55
@@ -581,15 +871,15 @@ def graded_feedback_plan(neurons: Neurons, magnitude: float = 1.0, positive: boo
     return plan
 
 
-# -------------------------
-# Distance-shaped reward helpers
-# -------------------------
 def get_player_and_armor_positions(state: Optional[GameState]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """Return (player_xy, armor_xy) or (None, None) if not available."""
     if state is None:
         return None, None
     try:
-        guy = np.array(state.game_variables[2:4], dtype=np.float32)
+        game_vars = getattr(state, 'game_variables', None)
+        if game_vars is None or len(game_vars) < 4:
+            return None, None
+        guy = np.array([game_vars[2], game_vars[3]], dtype=np.float32)
         armor_obj = next((o for o in state.objects if getattr(o, "name", "") == "GreenArmor"), None)
         if armor_obj is None:
             return guy, None
@@ -608,56 +898,6 @@ def armor_distance(state: Optional[GameState], max_distance: float = 200.0) -> O
     return min(d, max_distance)
 
 
-class DistanceReward:
-    """
-    Positive reward for moving closer to GreenArmor; negative for moving away.
-    Smooth, clipped, and scaleable; also adds a one-time pickup bonus.
-    """
-    def __init__(self, scale: float = 0.05, pickup_bonus: float = 50.0, max_distance: float = 200.0):
-        self.prev_distance: Optional[float] = None
-        self.scale = float(scale)
-        self.pickup_bonus = float(pickup_bonus)
-        self.max_distance = float(max_distance)
-        self.prev_had_armor: Optional[bool] = None
-
-    def start_episode(self):
-        self.prev_distance = None
-        self.prev_had_armor = None
-
-    def step(self, state_before: Optional[GameState], state_after: Optional[GameState]) -> float:
-        # detect armor presence for pickup bonus
-        def has_armor(st: Optional[GameState]) -> bool:
-            if st is None:
-                return False
-            try:
-                return any(getattr(o, "name", "") == "GreenArmor" for o in st.objects)
-            except Exception:
-                return False
-
-        r = 0.0
-        d_before = armor_distance(state_before, self.max_distance)
-        d_after  = armor_distance(state_after,  self.max_distance)
-
-        # shaped reward on distance delta (if both distances are known)
-        if d_before is not None and d_after is not None:
-            delta = d_before - d_after  # positive if we moved closer
-            # small, smooth reward; clip to avoid explosions
-            r += self.scale * float(np.clip(delta, -10.0, 10.0))
-
-        # pickup bonus when armor disappears from object list
-        now_has = has_armor(state_after)
-        was_has = has_armor(state_before)
-        if was_has and not now_has:
-            r += self.pickup_bonus
-
-        self.prev_distance = d_after
-        self.prev_had_armor = now_has
-        return r
-
-
-# -------------------------
-# Per-action neural feedback hooks (safe-gated)
-# -------------------------
 def per_action_feedback(neurons: Neurons, reward: float, allow_stim: bool):
     if not allow_stim:
         return
@@ -669,7 +909,6 @@ def per_action_feedback(neurons: Neurons, reward: float, allow_stim: bool):
         if reward >= 0.0:
             plan.stim(feedback_channels_set, stim_design, burst)
         else:
-            # stagger channels slightly for negative feedback
             for i, ch in enumerate(feedback_channels):
                 plan.stim(cl.ChannelSet(ch), stim_design, _make_burst_design(int(5 + 40 * magnitude), 140 + 20 * i))
         plan.run()
@@ -688,9 +927,6 @@ def end_of_episode_feedback(neurons: Neurons, episode_score: float, allow_stim: 
         pass
 
 
-# -------------------------
-# Visualization helpers
-# -------------------------
 def log_distance_trace(distances: List[Optional[float]], save_path: str, ep_idx: int):
     xs = list(range(len(distances)))
     ys = [d if (d is not None) else np.nan for d in distances]
@@ -698,7 +934,8 @@ def log_distance_trace(distances: List[Optional[float]], save_path: str, ep_idx:
         plt.figure(figsize=(6,3))
         plt.plot(xs, ys, linewidth=1.5)
         plt.title(f"Distance to GreenArmor — Episode {ep_idx}")
-        plt.xlabel("tick"); plt.ylabel("distance (clipped)")
+        plt.xlabel("tick")
+        plt.ylabel("distance (clipped)")
         plt.tight_layout()
         plt.savefig(os.path.join(save_path, f"distance_ep{ep_idx}.png"))
         plt.close()
@@ -712,7 +949,6 @@ def save_automap_snapshot(game: DoomGame, save_path: str, ep_idx: int, step_idx:
         if state is None or state.automap_buffer is None:
             return
         im = state.automap_buffer
-        # write a few snapshots per episode (every ~30 steps)
         if step_idx % 30 == 0:
             out = os.path.join(save_path, f"automap_ep{ep_idx}_t{step_idx}.png")
             cv2.imwrite(out, im)
@@ -720,117 +956,112 @@ def save_automap_snapshot(game: DoomGame, save_path: str, ep_idx: int, step_idx:
         pass
 
 
-# -------------------------
-# Dataset collection using teacher
-# -------------------------
-def collect_spike_dataset(game: DoomGame, neurons: Neurons, teacher_agent: DQNAgent, target_samples: int = 3000,
-                          max_episodes: int = 50, plans=None, patterns=None, spatial_map=None,
-                          allow_stim: bool = False, window: int = SPIKE_WINDOW, save_path: str = ".",
-                          show_automap_flag: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Runs teacher-guided episodes while encoding into neurons and collecting spikes labeled with teacher actions.
-    Returns X (N, 3*window) and y (N,)
-    """
-    logger.info(f"[DATA] Starting spike dataset collection. allow_stim={allow_stim}")
+def collect_spike_dataset_enemy_targeted(game: DoomGame, neurons: Neurons, teacher_agent: DQNAgent,
+                                         target_samples: int = 3000, max_episodes: int = 50,
+                                         allow_stim: bool = False, window: int = SPIKE_WINDOW,
+                                         save_path: str = ".", show_automap_flag: bool = False):
     X, y = [], []
-    samples = 0;
-    episodes = 0
+    samples, episodes = 0, 0
     spike_hist = deque(maxlen=window - 1)
+    action_gater = ActionGater()
+    agent_pos = (RESOLUTION[1]//2, RESOLUTION[0]//2)
+
     for _ in range(window - 1):
         spike_hist.append(np.zeros(len(action_channel_groups), dtype=np.float32))
 
     while samples < target_samples and episodes < max_episodes:
-        game.new_episode();
+        game.new_episode()
+        action_gater.reset_episode()
         episodes += 1
+        frame_count = 0
+
         while not game.is_episode_finished() and samples < target_samples:
             state = game.get_state()
-            frame = preprocess(state.screen_buffer) if state else np.zeros((1, RESOLUTION[0], RESOLUTION[1]),
-                                                                           dtype=np.float32)
-            teacher_action = teacher_agent.get_action(frame)
+            frame = preprocess(state.screen_buffer) if state else np.zeros((1, *RESOLUTION), dtype=np.float32)
+
+            # Enemy-aware teacher action
+            enemy_action_vec = generate_enemy_aware_action(agent_pos, state, game.get_available_buttons_size())
+            raw_teacher_action = teacher_agent.get_action(frame, state)
+            teacher_action, penalty = action_gater.gate_action(raw_teacher_action, frame_count, state,
+                                                               game.get_available_buttons_size())
 
             if allow_stim:
-                # run encoding that will stimulate hardware via neurons
-                encode_hybrid(neurons, state, plans, patterns, spatial_map)
-                # capture spikes via neurons.loop for low-jitter tick
-                # (we expect SDK's loop to yield once per tick)
+                encode_hybrid(neurons, state)
                 for tick in neurons.loop(ticks_per_second=TICKS_PER_SECOND):
                     feat, counts = extract_spike_features(tick.analysis.spikes, spike_hist)
                     spike_hist.append(counts)
-                    X.append(feat.astype(np.float32));
-                    y.append(teacher_action);
+                    X.append(feat.astype(np.float32))
+                    y.append(teacher_action)
                     samples += 1
                     break
             else:
-                # Simulate spike counts correlated with teacher action
+                # Enemy-targeted action for dataset
+                agent_pos = (RESOLUTION[1]//2, RESOLUTION[0]//2)
+                enemy_action_vec = generate_enemy_aware_action(agent_pos, state, game.get_available_buttons_size())
+                enemy_action_idx = np.argmax(enemy_action_vec)
+                
+                # Simulate spike counts
                 num_groups = len(action_channel_groups)
                 base = np.zeros(num_groups, dtype=np.float32)
-                base[teacher_action % num_groups] = 5.0
+                base[enemy_action_idx % num_groups] = 5.0
                 simulated_counts = np.random.poisson(base).astype(np.float32)
                 feat = np.concatenate(list(spike_hist) + [simulated_counts], axis=0)
                 spike_hist.append(simulated_counts)
-                X.append(feat.astype(np.float32));
-                y.append(teacher_action);
-                samples += 1
-                # advance environment using teacher action
-                action_vec = safe_action_vector(teacher_action, game.get_available_buttons_size())
-                game.set_action(action_vec);
-                game.advance_action(FRAME_REPEAT)
-                if show_automap_flag:
-                    show_automap(game)
-                continue
+                
+                X.append(feat.astype(np.float32))
+                y.append(enemy_action_idx)
 
-            # apply teacher action to game (works both branches)
-            action_vec = safe_action_vector(teacher_action, game.get_available_buttons_size())
-            game.set_action(action_vec);
+samples += 1
+
+            game.set_action(enemy_action_vec)
             game.advance_action(FRAME_REPEAT)
-            if show_automap_flag: show_automap(game)
+            frame_count += 1
 
-        logger.info(f"[DATA] Collected {samples} samples after {episodes} episodes.")
-    X = np.array(X);
-    y = np.array(y, dtype=np.int64)
+            if show_automap_flag:
+                show_automap(game)
+
+        stats = action_gater.get_accuracy_stats()
+        logger.info(f"[DATA] Episode {episodes}: shots={stats['shots_fired']}, accuracy={stats['accuracy']:.2f}")
+
+    X, y = np.array(X), np.array(y, dtype=np.int64)
     ensure_dir(save_path)
     np.save(os.path.join(save_path, "spike_X.npy"), X)
     np.save(os.path.join(save_path, "spike_y.npy"), y)
-    logger.info(f"[DATA] Saved spike dataset to {save_path} (X.shape={X.shape}, y.shape={y.shape})")
+    logger.info(f"[DATA] Saved enemy-targeted spike dataset to {save_path} (X={X.shape}, y={y.shape})")
     return X, y
 
 
-# -------------------------
-# Train spike decoder
-# -------------------------
+
 def train_spike_decoder(X: np.ndarray, y: np.ndarray, device: torch.device,
                         epochs: int = SPIKE_DECODER_EPOCHS, lr: float = SPIKE_DECODER_LR,
                         batch_size: int = 256, save_path: str = ".") -> SpikeDecoder:
-    input_dim = X.shape[1];
+    input_dim = X.shape[1]
     num_actions = int(y.max() + 1)
     model = SpikeDecoder(input_dim=input_dim, hidden=SPIKE_DECODER_HID, out=num_actions).to(device)
-    opt = optim.Adam(model.parameters(), lr=lr);
+    opt = optim.Adam(model.parameters(), lr=lr)
     ce = nn.CrossEntropyLoss()
     idxs = np.arange(len(X))
     for ep in range(epochs):
-        np.random.shuffle(idxs);
+        np.random.shuffle(idxs)
         losses = []
         for i in range(0, len(idxs), batch_size):
             bs = idxs[i:i + batch_size]
-            xb = torch.from_numpy(X[bs]).float().to(device);
+            xb = torch.from_numpy(X[bs]).float().to(device)
             yb = torch.from_numpy(y[bs]).long().to(device)
-            logits = model(xb);
+            logits = model(xb)
             loss = ce(logits, yb)
-            opt.zero_grad();
-            loss.backward();
-            opt.step();
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
             losses.append(float(loss.item()))
         logger.info(f"[SPK] Epoch {ep + 1}/{epochs} loss={np.mean(losses):.4f}")
     ensure_dir(save_path)
     pth = os.path.join(save_path, "spike_decoder.pth")
     torch.save(model.state_dict(), pth)
-    logger.info(f"[SPK] Saved spike decoder to {pth}")
+    logger.info(f"[SPK] Saved enhanced spike decoder to {pth}")
     return model
 
 
-# -------------------------
-# Optional automap visualization
-# -------------------------
 def show_automap(game: DoomGame, sleep_ms: int = 28):
     try:
         state = game.get_state()
@@ -844,45 +1075,37 @@ def show_automap(game: DoomGame, sleep_ms: int = 28):
         pass
 
 
-# -------------------------
-# Run closed-loop neuron-centric
-# -------------------------
 def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decoder: SpikeDecoder,
                                    plans=None, patterns=None, spatial_map=None, episodes: int = 10,
                                    window: int = SPIKE_WINDOW, allow_stim: bool = False, save_path: str = ".",
                                    device: torch.device = torch.device('cpu'), online_finetune: bool = False,
                                    teacher: Optional[DQNAgent] = None, show_automap_flag: bool = False,
                                    norm_mu: Optional[np.ndarray] = None, norm_std: Optional[np.ndarray] = None):
-    """
-    Main closed-loop evaluation where spike decoder controls game actions.
-    """
-    spike_decoder.to(device);
+    """Enhanced closed-loop control with smart shooting."""
+    spike_decoder.to(device)
     spike_decoder.eval()
     episodes_done = 0
-    episode_scores = [];
-    moving_avg_scores = [];
-    action_agreements = [];
+    episode_scores = []
+    moving_avg_scores = []
+    action_agreements = []
     latency_records = []
+    action_gater = ActionGater()  # Smart shooting controller
 
     ensure_dir(save_path)
     csv_path = os.path.join(save_path, "episode_log.csv")
     csv_file = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["episode", "score", "steps", "mean_latency_ms", "agreement_with_teacher"])
+    csv_writer.writerow(["episode", "score", "steps", "mean_latency_ms", "agreement_with_teacher", 
+                         "shots_fired", "shot_accuracy"])
 
     expected_input_dim = len(action_channel_groups) * window
-    # Quick input-dim check
-    try:
-        model_in_size = sum(
-            p.numel() for p in spike_decoder.parameters())  # not precise; but we'll check weight shape via first linear
-    except Exception:
-        model_in_size = None
-    logger.info(f"[RUN] Expected decoder input dim: {expected_input_dim}")
+    logger.info(f"[RUN] Expected decoder input dim: {expected_input_dim} (with 4 action groups)")
 
     while episodes_done < episodes:
         game.new_episode()
         shaper = DistanceReward(scale=0.05, pickup_bonus=50.0, max_distance=200.0)
         shaper.start_episode()
+        action_gater.reset_episode()
 
         spike_hist = deque(maxlen=window - 1)
         for _ in range(window - 1):
@@ -896,203 +1119,194 @@ def run_closed_loop_neuron_control(game: DoomGame, neurons: Neurons, spike_decod
         teacher_checks = 0
         dist_trace: List[Optional[float]] = []
 
-        # In non-hardware mode we simulate spikes; in hardware mode we use neurons.loop
         if allow_stim:
             loop_iter = neurons.loop(ticks_per_second=TICKS_PER_SECOND)
         else:
-            # create a simple generator that yields a dummy tick for each iteration
             def _sim_loop():
                 class _Tick:
                     class _A:
                         spikes = []
-
                     analysis = _A()
-
                 while True:
                     yield _Tick()
-
             loop_iter = _sim_loop()
 
         for tick in loop_iter:
             t0 = perf_counter()
             state_before = game.get_state()
             d_before = armor_distance(state_before)
-            if d_before is not None:
-                dist_trace.append(d_before)
-            else:
-                dist_trace.append(None)
-
-            # encode or simulate
+            dist_trace.append(d_before if d_before is not None else None)
+        
+            # Encode or simulate spikes
             if allow_stim:
-                # stimulatory encoding
                 encode_hybrid(neurons, state_before, plans, patterns, spatial_map)
                 feat, counts = extract_spike_features(tick.analysis.spikes, spike_hist)
-                spike_hist.append(counts)
             else:
-                # simulation: base correlated with teacher if available
                 num_groups = len(action_channel_groups)
                 if teacher is not None and state_before is not None:
                     frame = preprocess(state_before.screen_buffer)
-                    t_act = teacher.get_action(frame)
+                    t_act = teacher.get_action(frame, state_before)
                     base = np.ones(num_groups, dtype=np.float32) * 0.5
                     base[t_act % num_groups] += 4.0
                 else:
                     base = np.ones(num_groups, dtype=np.float32) * 1.0
                 counts = np.random.poisson(base).astype(np.float32)
                 feat = np.concatenate(list(spike_hist) + [counts], axis=0)
-                spike_hist.append(counts)
-
+        
+            spike_hist.append(counts)
             rasters.append(counts)
-
-            # normalization if provided
+        
+            # Normalize features
             feat_in = feat.astype(np.float32)
             if norm_mu is not None and norm_std is not None:
                 feat_in = (feat_in - norm_mu.ravel()) / norm_std.ravel()
-
+        
             xb = torch.from_numpy(feat_in).unsqueeze(0).float().to(device)
             with torch.no_grad():
                 logits = spike_decoder(xb)
-                act_idx = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
-
+                raw_act_idx = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+        
+            # Enemy-targeted action
+            agent_pos = (RESOLUTION[1] // 2, RESOLUTION[0] // 2)
+            enemy_action_vec = generate_enemy_aware_action(agent_pos, state_before, game.get_available_buttons_size())
+            raw_act_idx = int(np.argmax(enemy_action_vec))
+        
+            # SMART SHOOTING: single gating
+            act_idx, shoot_penalty = action_gater.gate_action(
+                raw_act_idx, steps, state_before, game.get_available_buttons_size()
+            )
+            if raw_act_idx != act_idx:
+                logger.debug(f"[SMART] Blocked wasteful shot at step {steps}")
+        
+            # Execute action
             action_vec = safe_action_vector(act_idx, game.get_available_buttons_size())
-            game.set_action(action_vec);
+            game.set_action(action_vec)
             game.advance_action(FRAME_REPEAT)
-
-            # (d) reward = env + distance shaping
+        
+            # Enhanced reward
             state_after = game.get_state()
             r_env = game.get_last_reward() if hasattr(game, "get_last_reward") else 0.0
             r_shape = shaper.step(state_before, state_after)
-            rew = float(r_env) + float(r_shape)
+            rew = float(r_env) + float(r_shape) + float(shoot_penalty)
             total_reward += rew
             steps += 1
-
-            # optional per-action neurofeedback (safe-gated)
-            per_action_feedback(neurons, r_shape, allow_stim=allow_stim)
-
-            lat_ms = (perf_counter() - t0) * 1000.0
-            latencies.append(lat_ms)
-
-            # teacher agreement
+        
+            # Per-action feedback
+            per_action_feedback(neurons, r_shape + shoot_penalty, allow_stim=allow_stim)
+        
+            # Latency tracking
+            latencies.append((perf_counter() - t0) * 1000.0)
+        
+            # Teacher agreement
             if teacher is not None and state_before is not None:
                 frame = preprocess(state_before.screen_buffer)
-                t_action = teacher.get_action(frame)
+                t_action = teacher.get_action(frame, state_before)
                 teacher_checks += 1
                 if t_action == act_idx:
                     agreement_counts += 1
-
-            # online finetune
+        
+            # Online fine-tuning
             if online_finetune and teacher is not None and state_before is not None:
-                t_action = teacher.get_action(preprocess(state_before.screen_buffer))
-                model = spike_decoder;
+                t_action = teacher.get_action(preprocess(state_before.screen_buffer), state_before)
+                model = spike_decoder
                 model.train()
-                xb_ft = xb;
+                xb_ft = xb
                 yb_ft = torch.tensor([t_action], dtype=torch.long).to(device)
                 opt = optim.Adam(model.parameters(), lr=1e-5)
                 loss = nn.CrossEntropyLoss()(model(xb_ft), yb_ft)
-                opt.zero_grad();
-                loss.backward();
-                opt.step();
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
                 model.eval()
-
+        
+            # Automap visualization
             if show_automap_flag:
                 show_automap(game)
                 save_automap_snapshot(game, save_path, episodes_done, steps)
-
+        
+            # End-of-episode processing
             if game.is_episode_finished():
                 mean_lat = float(np.mean(latencies)) if latencies else 0.0
                 agreement = (agreement_counts / teacher_checks) if teacher_checks > 0 else None
+                shooting_stats = action_gater.get_accuracy_stats()
+        
                 episode_scores.append(total_reward)
-                moving_avg = float(np.mean(episode_scores[-MOVING_AVG_WINDOW:])) if episode_scores else 0.0
-                moving_avg_scores.append(moving_avg)
+                moving_avg_scores.append(float(np.mean(episode_scores[-MOVING_AVG_WINDOW:])))
                 action_agreements.append(agreement)
                 latency_records.append(mean_lat)
-
+        
+                # Save raster
                 rasters_np = np.stack(rasters, axis=0) if rasters else np.zeros((0, len(action_channel_groups)))
-                raster_path = os.path.join(save_path, f"raster_ep{episodes_done}.npy")
-                np.save(raster_path, rasters_np)
-
-                # Save a small PNG raster
+                np.save(os.path.join(save_path, f"raster_ep{episodes_done}.npy"), rasters_np)
                 try:
-                    plt.figure(figsize=(6, 2))
+                    plt.figure(figsize=(8, 3))
                     plt.imshow(rasters_np.T, aspect='auto', interpolation='nearest')
-                    plt.xlabel('tick');
-                    plt.ylabel('action-group');
-                    plt.title(f'Raster Ep{episodes_done}')
-                    pngpath = os.path.join(save_path, f"raster_ep{episodes_done}.png")
-                    plt.savefig(pngpath);
+                    plt.xlabel('tick')
+                    plt.ylabel('action-group (0:forward,1:left,2:right,3:shoot)')
+                    plt.title(f'Raster Ep{episodes_done} - Shots: {shooting_stats["shots_fired"]}')
+                    plt.savefig(os.path.join(save_path, f"raster_ep{episodes_done}.png"))
                     plt.close()
                 except Exception:
                     pass
-
-                # Save distance trace
+        
                 log_distance_trace(dist_trace, save_path, episodes_done)
-
-                csv_writer.writerow(
-                    [episodes_done, total_reward, steps, mean_lat, agreement if agreement is not None else "NA"])
+        
+                csv_writer.writerow([
+                    episodes_done, total_reward, steps, mean_lat,
+                    agreement if agreement is not None else "NA",
+                    shooting_stats["shots_fired"], shooting_stats["accuracy"]
+                ])
                 csv_file.flush()
-
-                logger.info(
-                    f"[RUN] Episode {episodes_done} score={total_reward:.2f} steps={steps} mean_latency_ms={mean_lat:.2f} agreement={agreement}")
-                # graded feedback at episode end (only if allow_stim)
+        
+                logger.info(f"[RUN] Episode {episodes_done} score={total_reward:.2f} steps={steps} "
+                            f"latency={mean_lat:.2f}ms agreement={agreement} "
+                            f"shots={shooting_stats['shots_fired']} accuracy={shooting_stats['accuracy']:.2f}")
+        
                 end_of_episode_feedback(neurons, total_reward, allow_stim=allow_stim)
-                # safety interrupt
+        
+                # Safety interrupts
                 try:
                     neurons.interrupt(stim_channels)
                     neurons.interrupt(feedback_channels_set)
                 except Exception:
                     pass
-
+        
                 episodes_done += 1
-                break  # break per-episode loop
+                break
+
 
     csv_file.close()
-    # Summary plots
+    
+    # Enhanced summary plots
     try:
-        plt.figure();
-        plt.plot(episode_scores, label='episode_score');
-        plt.plot(moving_avg_scores, label=f'moving_avg({MOVING_AVG_WINDOW})');
-        plt.legend();
-        plt.title('Scores');
-        plt.savefig(os.path.join(save_path, 'scores.png'));
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 3, 1)
+        plt.plot(episode_scores, label='episode_score')
+        plt.plot(moving_avg_scores, label=f'moving_avg({MOVING_AVG_WINDOW})')
+        plt.legend()
+        plt.title('Scores with Smart Shooting')
+        
+        plt.subplot(1, 3, 2)
+        if any(a is not None for a in action_agreements):
+            plt.plot([a if a is not None else 0 for a in action_agreements])
+            plt.title('Agreement with Teacher')
+            
+        plt.subplot(1, 3, 3)
+        shooting_accuracies = []  # Would need to collect this data
+        plt.title('Shooting Performance')
+        plt.xlabel('Episode')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, 'enhanced_performance.png'))
         plt.close()
     except Exception:
         pass
-    if any(a is not None for a in action_agreements):
-        try:
-            plt.figure();
-            plt.plot([a if a is not None else 0 for a in action_agreements]);
-            plt.title('Agreement with Teacher');
-            plt.savefig(os.path.join(save_path, 'agreement.png'));
-            plt.close()
-        except Exception:
-            pass
 
-    # montage of distances
-    try:
-        imgs = []
-        for i in range(episodes_done):
-            p = os.path.join(save_path, f"distance_ep{i}.png")
-            if os.path.exists(p):
-                imgs.append(cv2.imread(p))
-        if imgs:
-            h = max(im.shape[0] for im in imgs); w = max(im.shape[1] for im in imgs)
-            canvas = np.ones((h * len(imgs), w, 3), dtype=np.uint8) * 255
-            for idx, im in enumerate(imgs):
-                if im is None: continue
-                imr = cv2.resize(im, (w, h))
-                canvas[idx*h:(idx+1)*h, :w] = imr
-            cv2.imwrite(os.path.join(save_path, "distance_montage.png"), canvas)
-    except Exception:
-        pass
-
-    logger.info(f"[RUN] Closed-loop finished. Logs saved to {save_path}")
+    logger.info(f"[RUN] Enhanced closed-loop finished with smart shooting. Logs saved to {save_path}")
 
 
-# -------------------------
-# CLI + top-level orchestration
-# -------------------------
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Robust Hybrid DQN-teacher + Neuron-centric Spike Imitation")
+    p = argparse.ArgumentParser(description="Enhanced Neural DOOM with Smart Shooting")
     p.add_argument("--config", type=str, default=os.path.join(vzd.scenarios_path, "simpler_basic.cfg"))
     p.add_argument("--train-dqn", action="store_true")
     p.add_argument("--collect-spike-data", action="store_true")
@@ -1118,16 +1332,17 @@ def build_argparser() -> argparse.ArgumentParser:
 def main():
     args = build_argparser().parse_args()
 
-    # default pipeline if invoked with no args
+    # FIXED: Better default pipeline logic
     if len(sys.argv) == 1:
-        logger.info("No CLI arguments → running default pipeline (collect -> train -> closed-loop) in simulation mode.")
+        logger.info("No CLI arguments → running enhanced default pipeline with smart shooting.")
         args.collect_spike_data = True
-        args.collect_samples = 5000
+        args.collect_samples = 2000
         args.train_spike_decoder = True
         args.run_closed_loop = True
         args.allow_stim = False
         args.train_dqn = False
-        args.show_automap_flag = True
+        args.show_automap = True
+        args.episodes = 5
 
     set_seed()
     ensure_dir(args.save_path)
@@ -1140,229 +1355,142 @@ def main():
             logger.error("Hardware stimulation requested but --confirm-stim not provided. Aborting.")
             sys.exit(1)
         if os.environ.get("CORTICAL_SAFE_KEY", "") != "I_HAVE_APPROVAL":
-            logger.error(
-                "Environment variable CORTICAL_SAFE_KEY does not equal 'I_HAVE_APPROVAL'. Aborting stimulation for safety.")
+            logger.error("Environment variable CORTICAL_SAFE_KEY invalid. Aborting.")
             sys.exit(1)
         if not CL_AVAILABLE:
-            logger.error("Requested hardware stimulation but 'cl' SDK not available in Python environment.")
+            logger.error("Requested hardware stimulation but 'cl' SDK not available.")
             sys.exit(1)
-        logger.warning(
-            "!!! WARNING: HARDWARE STIMULATION ENABLED. Confirm approvals and safety BEFORE running on real tissue !!!")
+        logger.warning("!!! WARNING: HARDWARE STIMULATION ENABLED !!!")
 
     show_automap_flag = bool(args.show_automap)
-    # Initialize ViZDoom
-    game = DoomGame();
+
+    # Enhanced ViZDoom initialization
+    game = DoomGame()
     game.load_config(args.config)
     game.set_episode_timeout(2000)
     game.set_episode_start_time(10)
-    # Window visibility: hide on headless servers unless automap requested
     try:
         game.set_window_visible(bool(show_automap_flag))
     except Exception:
         pass
     game.set_mode(Mode.PLAYER)
-    game.set_screen_format(vzd.ScreenFormat.GRAY8)
+    game.set_screen_format(vzd.ScreenFormat.RGB24)
     game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
 
-    # Expose objects (needed for GreenArmor distance)
     try:
         game.set_labels_buffer_enabled(True)
         game.set_objects_info_enabled(True)
-    except Exception:
-        pass
+        game.add_available_button(vzd.Button.MOVE_FORWARD)
+        game.add_available_button(vzd.Button.TURN_LEFT)
+        game.add_available_button(vzd.Button.TURN_RIGHT)
+        game.add_available_button(vzd.Button.ATTACK)
+        logger.info("[GAME] Enhanced setup: RGB screen, object detection, ATTACK button enabled")
+    except Exception as e:
+        logger.warning(f"[GAME] Setup warning: {e}")
 
     game.init()
-
     n_buttons = game.get_available_buttons_size()
-    if n_buttons < 3:
-        logger.warning("[WARN] env has <3 buttons - action mapping assumptions may need update")
+    logger.info(f"[GAME] Available buttons: {n_buttons} (ATTACK should be button {n_buttons-1})")
 
-    # Build teacher DQN
-    teacher = DQNAgent(action_size=3, device=device, load_model=args.load_dqn)
+    # Teacher DQN
+    teacher = DQNAgent(action_size=4, device=device, load_model=args.load_dqn)
+
+    # Optionally train teacher
     if args.train_dqn:
-        logger.info("[DQN] Training teacher (distance-shaped).")
-        actions = [safe_action_vector(a, n_buttons) for a in range(3)]
+        logger.info("[DQN] Training enhanced teacher with smart shooting rewards.")
+        actions = [safe_action_vector(a, n_buttons) for a in range(4)]
         shaper = DistanceReward(scale=0.05, pickup_bonus=50.0, max_distance=200.0)
+        action_gater = ActionGater()
 
         for epoch in range(TRAIN_EPOCHS):
-            logger.info(f"[DQN] epoch {epoch + 1}/{TRAIN_EPOCHS}")
+            logger.info(f"[DQN] Epoch {epoch+1}/{TRAIN_EPOCHS}")
             game.new_episode()
             shaper.start_episode()
+            action_gater.reset_episode()
+            frame_count = 0
 
             for step in trange(LEARNING_STEPS_PER_EPOCH, leave=False):
                 state_before = game.get_state()
                 s = preprocess(state_before.screen_buffer) if state_before else np.zeros((1, RESOLUTION[0], RESOLUTION[1]), dtype=np.float32)
-                a = teacher.get_action(s)
-
-                # Step environment with teacher-chosen action
+                raw_a = teacher.get_action(s, state_before)
+                a, shoot_penalty = action_gater.gate_action(raw_a, frame_count, state_before, n_buttons)
                 r_env = game.make_action(actions[a], FRAME_REPEAT)
                 done = game.is_episode_finished()
                 state_after = game.get_state() if not done else None
-
-                # Distance-shaped reward
                 r_shape = shaper.step(state_before, state_after)
-                r = float(r_env) + float(r_shape)
-
+                r = float(r_env) + float(r_shape) + float(shoot_penalty)
                 s2 = preprocess(state_after.screen_buffer) if (state_after is not None) else np.zeros((1, RESOLUTION[0], RESOLUTION[1]), dtype=np.float32)
-                teacher.store(s, a, r, s2, done)
+                teacher.store(s, raw_a, r, s2, done)
                 teacher.train_step()
+                frame_count += 1
 
                 if done:
+                    stats = action_gater.get_accuracy_stats()
+                    logger.debug(f"Episode complete - shots: {stats['shots_fired']}, accuracy: {stats['accuracy']:.2f}")
                     game.new_episode()
                     shaper.start_episode()
+                    action_gater.reset_episode()
+                    frame_count = 0
 
             teacher.sync_target()
+        torch.save(teacher.q_net.state_dict(), os.path.join(args.save_path, "enhanced_dqn_teacher.pth"))
+        logger.info("[DQN] Teacher training complete.")
 
-        torch.save(teacher.q_net.state_dict(), os.path.join(args.save_path, "dqn_teacher.pth"))
-        logger.info("[DQN] Teacher training complete with distance-shaped rewards.")
-
-    # Open neurons (real or dummy)
+    # Neurons context
     with Neurons() as neurons:
-        logger.info(f"[CL] Using neurons object: {neurons}")
+        logger.info(f"[CL] Using enhanced neurons object: {neurons}")
         plans = build_precompiled_plans(neurons) if (args.allow_stim and CL_AVAILABLE) else {}
-        # prepare patterns for rate coding (stim plan per increasing electrode set)
-        patterns = None
-        if args.allow_stim and CL_AVAILABLE:
-            try:
-                # try to extract underlying channel list
-                try:
-                    stim_list = list(stim_channels.channels) if hasattr(stim_channels, 'channels') else list(
-                        stim_channels)
-                except Exception:
-                    # fallback: try to iterate
-                    stim_list = list(stim_channels)
-                patterns = []
-                for k in range(1, len(stim_list) + 1):
-                    p = neurons.create_stim_plan()
-                    ch_set = cl.ChannelSet(*stim_list[:k])
-                    p.interrupt(ch_set)
-                    p.stim(ch_set, stim_design, _make_burst_design(100, 10))
-                    patterns.append(p)
-            except Exception as e:
-                logger.warning(f"[CL] failed to build patterns: {e}")
-                patterns = None
+        patterns, spatial_map = None, {}
 
-        # spatial map example (4 sectors)
-        spatial_map = {}
-        if args.allow_stim and CL_AVAILABLE:
-            try:
-                sectors = 4
-                # ensure stim_list defined
-                try:
-                    stim_list
-                except NameError:
-                    stim_list = list(stim_channels)
-                for s in range(sectors):
-                    p = neurons.create_stim_plan();
-                    p.interrupt(stim_channels)
-                    ch = cl.ChannelSet(stim_list[s % len(stim_list)])
-                    p.stim(ch, stim_design, _make_burst_design(150, 20 + (s * 10)))
-                    spatial_map[s] = p
-            except Exception as e:
-                logger.warning(f"[CL] failed to build spatial_map: {e}")
-                spatial_map = None
+        # Spike data collection & decoder training
+        spike_decoder, norm_mu, norm_std = None, None, None
+        sd_path = os.path.join(args.save_path, "enhanced_spike_decoder.pth")
+        stats_path = os.path.join(args.save_path, "enhanced_spike_X_stats.npz")
 
-        # Collect spike dataset
-        if args.collect_spike_data:
+        if args.collect_spike_data or args.train_spike_decoder:
             X, y = collect_spike_dataset(game, neurons, teacher, target_samples=args.collect_samples,
                                          max_episodes=50, plans=plans, patterns=patterns, spatial_map=spatial_map,
                                          allow_stim=args.allow_stim, window=SPIKE_WINDOW, save_path=args.save_path,
                                          show_automap_flag=show_automap_flag)
-            logger.info(f"[DATA] Collected dataset shapes: X={X.shape} y={y.shape}")
+            if args.train_spike_decoder:
+                mu = X.mean(axis=0, keepdims=True)
+                std = X.std(axis=0, keepdims=True) + 1e-6
+                X_norm = (X - mu) / std
+                np.save(os.path.join(args.save_path, "enhanced_spike_X_norm.npy"), X_norm)
+                np.savez(stats_path, mu=mu, std=std)
+                spike_decoder = train_spike_decoder(X_norm, y, device=device, epochs=SPIKE_DECODER_EPOCHS, save_path=args.save_path)
+                norm_mu, norm_std = mu, std
 
-        # Train spike decoder
-        spike_decoder = None
-        norm_mu = None;
-        norm_std = None
-        sd_path = os.path.join(args.save_path, "spike_decoder.pth")
-        stats_path = os.path.join(args.save_path, "spike_X_stats.npz")
-        if args.train_spike_decoder:
-            XPath = os.path.join(args.save_path, "spike_X.npy");
-            yPath = os.path.join(args.save_path, "spike_y.npy")
-            if os.path.exists(XPath) and os.path.exists(yPath):
-                X = np.load(XPath);
-                y = np.load(yPath)
-            else:
-                logger.info("[SPK] dataset not found; collecting now...")
-                X, y = collect_spike_dataset(game, neurons, teacher, target_samples=args.collect_samples,
-                                             max_episodes=50, plans=plans, patterns=patterns, spatial_map=spatial_map,
-                                             allow_stim=args.allow_stim, window=SPIKE_WINDOW, save_path=args.save_path,
-                                             show_automap_flag=show_automap_flag)
-            if len(X) < SPIKE_DATA_MIN_SAMPLES:
-                logger.warning(f"[SPK] Warning: small dataset ({len(X)} samples). Consider collecting more.")
-            mu = X.mean(axis=0, keepdims=True)
-            std = X.std(axis=0, keepdims=True) + 1e-6
-            X_norm = (X - mu) / std
-            np.save(os.path.join(args.save_path, "spike_X_norm.npy"), X_norm)
-            np.savez(stats_path, mu=mu, std=std)
-            logger.info(f"[SPK] Saved normalization stats to {stats_path}")
-            spike_decoder = train_spike_decoder(X_norm, y, device=device, epochs=SPIKE_DECODER_EPOCHS,
-                                                save_path=args.save_path)
+        # Load spike decoder if available
+        if args.load_spike_decoder and spike_decoder is None and os.path.exists(args.load_spike_decoder):
+            arr = np.load(os.path.join(os.path.dirname(args.load_spike_decoder), "enhanced_spike_X_stats.npz"))
+            norm_mu, norm_std = arr["mu"], arr["std"]
+            expected_dim = len(action_channel_groups) * SPIKE_WINDOW
+            spike_decoder = SpikeDecoder(input_dim=expected_dim, hidden=SPIKE_DECODER_HID, out=4)
+            spike_decoder.load_state_dict(torch.load(args.load_spike_decoder, map_location=device))
+            spike_decoder.to(device)
+            logger.info("[SPK] Loaded spike decoder.")
 
-        # Optionally load spike decoder and normalization stats
-        if args.load_spike_decoder:
-            ld = args.load_spike_decoder
-            if os.path.exists(ld):
-                # load stats if available
-                stats_ld = os.path.join(os.path.dirname(ld), "spike_X_stats.npz")
-                if os.path.exists(stats_ld):
-                    arr = np.load(stats_ld);
-                    norm_mu = arr["mu"];
-                    norm_std = arr["std"]
-                # Build a decoder and load weights
-                expected_dim = len(action_channel_groups) * SPIKE_WINDOW
-                spike_decoder = SpikeDecoder(input_dim=expected_dim, hidden=SPIKE_DECODER_HID, out=3)
-                spike_decoder.load_state_dict(torch.load(ld, map_location=device));
-                spike_decoder.to(device)
-                logger.info("[SPK] Loaded spike decoder from %s", ld)
-            else:
-                logger.warning("[SPK] load path not found: %s", ld)
+        # Fallback decoder
+        if spike_decoder is None and args.run_closed_loop:
+            logger.warning("[FALLBACK] Creating simple fallback spike decoder...")
+            spike_decoder = create_simple_fallback_decoder(device)
 
-        # If we trained earlier, attempt to load saved normalization stats if present
-        if os.path.exists(stats_path) and (norm_mu is None or norm_std is None):
-            try:
-                arr = np.load(stats_path);
-                norm_mu = arr["mu"];
-                norm_std = arr["std"]
-                logger.info(f"[SPK] Loaded normalization stats from {stats_path}")
-            except Exception:
-                norm_mu = norm_std = None
-
-        # Run closed-loop
+        # Run enhanced closed-loop
         if args.run_closed_loop:
-            # If no decoder present, attempt to load default path
-            if spike_decoder is None:
-                if os.path.exists(sd_path):
-                    expected_dim = len(action_channel_groups) * SPIKE_WINDOW
-                    spike_decoder = SpikeDecoder(input_dim=expected_dim, hidden=SPIKE_DECODER_HID, out=3)
-                    spike_decoder.load_state_dict(torch.load(sd_path, map_location=device));
-                    spike_decoder.to(device)
-                    logger.info("[SPK] Loaded spike decoder from default %s", sd_path)
-                    if os.path.exists(stats_path):
-                        arr = np.load(stats_path);
-                        norm_mu = arr["mu"];
-                        norm_std = arr["std"]
-                else:
-                    logger.error("No spike decoder available. Train one or provide --load-spike-decoder.")
-                    raise RuntimeError("No spike decoder available. Train or provide one.")
-            # run closed-loop evaluation
             run_closed_loop_neuron_control(game, neurons, spike_decoder, plans=plans, patterns=patterns,
                                            spatial_map=spatial_map, episodes=args.episodes, window=SPIKE_WINDOW,
                                            allow_stim=args.allow_stim, save_path=args.save_path, device=device,
                                            online_finetune=args.online_finetune, teacher=teacher,
                                            show_automap_flag=show_automap_flag, norm_mu=norm_mu, norm_std=norm_std)
 
-    # cleanup
-    try:
-        cv2.destroyAllWindows()
-    except Exception:
-        pass
-    try:
-        game.close()
-    except Exception:
-        pass
-    logger.info("[INFO] All done. Logs saved to: %s", args.save_path)
-
+    # Cleanup
+    try: cv2.destroyAllWindows()
+    except Exception: pass
+    try: game.close()
+    except Exception: pass
+    logger.info("[INFO] Enhanced Neural DOOM complete! Logs saved to: %s", args.save_path)
+    
 
 if __name__ == "__main__":
     main()

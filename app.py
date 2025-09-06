@@ -638,13 +638,41 @@ def main():
 
     # init Doom
     game = DoomGame(); game.load_config(args.config)
+
+    # Make sure episodes don’t end instantly
+    game.set_episode_timeout(2000)  # ~2000 tics per episode
+    game.set_episode_start_time(10)  # skip the first frames to avoid spawn flicker
+
     game.set_window_visible(True)
     game.set_mode(Mode.PLAYER)
     game.set_screen_format(vzd.ScreenFormat.GRAY8)
     game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
     game.init()
+
     n_buttons = game.get_available_buttons_size()
-    if n_buttons < 3: print("[WARN] env has <3 buttons - action mapping assumptions may need update")
+    if n_buttons < 3:
+        print("[WARN] env has <3 buttons - action mapping assumptions may need update")
+
+    # ------------------------
+    # Run episodes properly
+    # ------------------------
+    if args.run_closed_loop:
+        print("[INFO] Running closed-loop control...")
+        for ep in range(args.episodes):
+            game.new_episode()
+            while not game.is_episode_finished():
+                state = game.get_state()
+                if state is None:
+                    continue
+
+                # 👉 TODO: Replace with decoder prediction
+                action_idx = 0
+                action = [0] * n_buttons
+                action[action_idx] = 1
+
+                reward = game.make_action(action, FRAME_REPEAT)
+
+            print(f"Episode {ep+1} finished, total reward {game.get_total_reward()}")
 
     # Build teacher (DQN)
     teacher = DQNAgent(action_size=3, device=device, load_model=args.load_dqn)

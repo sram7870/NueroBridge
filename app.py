@@ -956,10 +956,18 @@ def save_automap_snapshot(game: DoomGame, save_path: str, ep_idx: int, step_idx:
         pass
 
 
-def collect_spike_dataset_enemy_targeted(game: DoomGame, neurons: Neurons, teacher_agent: DQNAgent,
-                                         target_samples: int = 3000, max_episodes: int = 50,
-                                         allow_stim: bool = False, window: int = SPIKE_WINDOW,
-                                         save_path: str = ".", show_automap_flag: bool = False):
+def collect_spike_dataset_enemy_targeted(
+        game: DoomGame,
+        neurons: Neurons,
+        teacher_agent: DQNAgent,
+        target_samples: int = 3000,
+        max_episodes: int = 50,
+        allow_stim: bool = False,
+        window: int = SPIKE_WINDOW,
+        save_path: str = ".",
+        show_automap_flag: bool = False
+):
+    """Collect a spike dataset for enemy-targeted actions."""
     X, y = [], []
     samples, episodes = 0, 0
     spike_hist = deque(maxlen=window - 1)
@@ -979,8 +987,11 @@ def collect_spike_dataset_enemy_targeted(game: DoomGame, neurons: Neurons, teach
             state = game.get_state()
             frame = preprocess(state.screen_buffer) if state else np.zeros((1, *RESOLUTION), dtype=np.float32)
 
-            # Enemy-aware teacher action
+            # Determine enemy-aware action
             enemy_action_vec = generate_enemy_aware_action(agent_pos, state, game.get_available_buttons_size())
+            enemy_action_idx = np.argmax(enemy_action_vec)
+
+            # Teacher action
             raw_teacher_action = teacher_agent.get_action(frame, state)
             teacher_action, penalty = action_gater.gate_action(raw_teacher_action, frame_count, state,
                                                                game.get_available_buttons_size())
@@ -993,26 +1004,21 @@ def collect_spike_dataset_enemy_targeted(game: DoomGame, neurons: Neurons, teach
                     X.append(feat.astype(np.float32))
                     y.append(teacher_action)
                     samples += 1
-                    break
+                    break  # one spike sample per loop iteration
             else:
-                # Enemy-targeted action for dataset
-                agent_pos = (RESOLUTION[1]//2, RESOLUTION[0]//2)
-                enemy_action_vec = generate_enemy_aware_action(agent_pos, state, game.get_available_buttons_size())
-                enemy_action_idx = np.argmax(enemy_action_vec)
-                
-                # Simulate spike counts
+                # Simulate spike counts for enemy-targeted action
                 num_groups = len(action_channel_groups)
                 base = np.zeros(num_groups, dtype=np.float32)
                 base[enemy_action_idx % num_groups] = 5.0
                 simulated_counts = np.random.poisson(base).astype(np.float32)
                 feat = np.concatenate(list(spike_hist) + [simulated_counts], axis=0)
                 spike_hist.append(simulated_counts)
-                
+
                 X.append(feat.astype(np.float32))
                 y.append(enemy_action_idx)
+                samples += 1
 
-samples += 1
-
+            # Step environment
             game.set_action(enemy_action_vec)
             game.advance_action(FRAME_REPEAT)
             frame_count += 1
@@ -1028,8 +1034,8 @@ samples += 1
     np.save(os.path.join(save_path, "spike_X.npy"), X)
     np.save(os.path.join(save_path, "spike_y.npy"), y)
     logger.info(f"[DATA] Saved enemy-targeted spike dataset to {save_path} (X={X.shape}, y={y.shape})")
-    return X, y
 
+    return X, y
 
 
 def train_spike_decoder(X: np.ndarray, y: np.ndarray, device: torch.device,

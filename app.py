@@ -1,8 +1,6 @@
-# This code solves for steps one and two using an ML model and innovative ML components. I am yet to incorporate an enemy.
-# I was not able to completely test this, but I did test some aspects of it so far. It is still a little bit of a work in progress...
-# If y'all can go through this and help me sort most of it out, then that would be great. I used ChatGPT a lot, but overall, I think I understood most of it
-
+```python
 #!/usr/bin/env python3
+import sys
 """
 Hybrid closed-loop ViZDoom + cl (neural stim) system — improved.
 
@@ -41,6 +39,8 @@ import cl  # cl SDK
 from cl import Neurons
 from cl.closed_loop import LoopTick
 from cl.stim_plan import StimPlan
+
+import cv2
 
 # -------------------------
 # Config / Hyperparameters
@@ -102,8 +102,6 @@ def preprocess(img):
 # -----------------------------
 # Optional automap visualization
 # -----------------------------
-import cv2
-
 def show_automap(game, sleep_ms=28):
     """
     Display the automap in a CV2 window. Non-blocking.
@@ -367,7 +365,7 @@ def graded_feedback_plan(neurons: Neurons, magnitude=1.0, positive=True):
 # -------------------------
 def collect_spike_dataset(game, neurons: Neurons, teacher_agent: DQNAgent, target_samples=3000,
                           max_episodes=50, plans=None, patterns=None, spatial_map=None,
-                          allow_stim=False, window=SPIKE_WINDOW, save_path="."):
+                          allow_stim=False, window=SPIKE_WINDOW, save_path=".", show_automap_flag=False):
     """
     Runs teacher-guided episodes while encoding into neurons and collecting spikes labeled with teacher actions.
     Returns X (N, 3*window) and y (N,)
@@ -390,8 +388,27 @@ def collect_spike_dataset(game, neurons: Neurons, teacher_agent: DQNAgent, targe
             if allow_stim:
                 encode_hybrid(neurons, state, plans, patterns, spatial_map)
             else:
-                # if simulation-only, optionally simulate spike counts (small noise)
-                pass
+                # 💡 Simulate spike counts correlated with teacher action
+                num_groups = len(action_channel_groups)
+                base = np.zeros(num_groups, dtype=np.float32)
+                base[teacher_action % num_groups] = 5.0  # bias one group to fire more
+                simulated_counts = np.random.poisson(base).astype(np.float32)
+
+                # Build feature vector (history + new counts)
+                feat = np.concatenate(list(spike_hist) + [simulated_counts], axis=0)
+                spike_hist.append(simulated_counts)
+
+                X.append(feat.astype(np.float32))
+                y.append(teacher_action)
+                samples += 1
+                # apply teacher action to game for environment progression
+                action_vec = [0]*game.get_available_buttons_size()
+                if len(action_vec) >= 3: action_vec[teacher_action] = 1
+                else: action_vec = [1 if i==teacher_action else 0 for i in range(len(action_vec))]
+                game.set_action(action_vec); game.advance_action(FRAME_REPEAT)
+                if show_automap_flag:
+                    show_automap(game)
+                continue  # skip neuron.loop() since we simulated
 
             # Use neurons.loop for a single tick to get low-jitter spike capture
             for tick in neurons.loop(ticks_per_second=TICKS_PER_SECOND):
@@ -437,7 +454,7 @@ def train_spike_decoder(X, y, device, epochs=SPIKE_DECODER_EPOCHS, lr=SPIKE_DECO
 def run_closed_loop_neuron_control(game, neurons: Neurons, spike_decoder: SpikeDecoder, plans=None, patterns=None,
                                    spatial_map=None, episodes=10, window=SPIKE_WINDOW, allow_stim=False,
                                    save_path=".", device=torch.device('cpu'), online_finetune=False,
-                                   teacher=None):
+                                   teacher=None, show_automap_flag=False):
     """
     Main closed-loop evaluation where spike decoder controls game actions.
     Also logs spike rasters, action agreement with teacher (if provided), latency, and reward curves.
@@ -463,18 +480,34 @@ def run_closed_loop_neuron_control(game, neurons: Neurons, spike_decoder: SpikeD
         total_reward = 0.0; steps=0; rasters=[]; start_ts=time(); latencies=[]
         agreement_counts = 0; teacher_checks = 0
 
+        # run ticks until episode finished
         for tick in neurons.loop(ticks_per_second=TICKS_PER_SECOND):
             t0 = time()
             state = game.get_state()
-            # encode
+
+            # encode or simulate
             if allow_stim:
                 encode_hybrid(neurons, state, plans, patterns, spatial_map)
+                # capture spikes and build feature
+                feat, counts = extract_spike_features(tick.analysis.spikes, spike_hist)
+                spike_hist.append(counts)
+            else:
+                # simulate spikes correlated with teacher (if teacher exists) or weak baseline
+                num_groups = len(action_channel_groups)
+                if teacher is not None:
+                    frame = preprocess(state.screen_buffer) if state else np.zeros((1,RESOLUTION[0],RESOLUTION[1]), dtype=np.float32)
+                    t_act = teacher.get_action(frame)
+                    base = np.zeros(num_groups, dtype=np.float32)
+                    base[t_act % num_groups] = 5.0
+                else:
+                    base = np.ones(num_groups, dtype=np.float32) * 1.0
+                counts = np.random.poisson(base).astype(np.float32)
+                feat = np.concatenate(list(spike_hist) + [counts], axis=0)
+                spike_hist.append(counts)
 
-            # capture spikes and build feature
-            feat, counts = extract_spike_features(tick.analysis.spikes, spike_hist)
-            spike_hist.append(counts)
             rasters.append(counts)  # store per-tick counts (small)
 
+            # prepare input for decoder
             xb = torch.from_numpy(feat).unsqueeze(0).float().to(device)
             with torch.no_grad():
                 logits = spike_decoder(xb)
@@ -488,7 +521,6 @@ def run_closed_loop_neuron_control(game, neurons: Neurons, spike_decoder: SpikeD
 
             # reward
             rew = game.get_last_reward()
-            # optional custom shaping (distance-based) can be added here
             total_reward += rew; steps += 1
 
             # latency measurement
@@ -504,13 +536,16 @@ def run_closed_loop_neuron_control(game, neurons: Neurons, spike_decoder: SpikeD
 
             # Optional online finetune: small supervised step towards teacher (if provided)
             if online_finetune and teacher is not None:
-                # small supervised step: (feat -> teacher action)
                 model = spike_decoder; model.train()
                 xb_ft = xb; yb_ft = torch.tensor([t_action], dtype=torch.long).to(device)
+                # create small optimizer per-run (cheap) — OK for low-rate finetune
                 opt = optim.Adam(model.parameters(), lr=1e-5)
                 loss = nn.CrossEntropyLoss()(model(xb_ft), yb_ft)
                 opt.zero_grad(); loss.backward(); opt.step()
                 model.eval()
+
+            if show_automap_flag:
+                show_automap(game)
 
             if game.is_episode_finished():
                 mean_lat = np.mean(latencies) if latencies else 0.0
@@ -581,12 +616,25 @@ def build_argparser():
 
 def main():
     args = build_argparser().parse_args()
+
+    # If no args, enable full pipeline with simulation (safe defaults)
+    if len(sys.argv) == 1:
+        print("No CLI arguments → running full default pipeline (collect → train → closed-loop)")
+        args.collect_spike_data = True
+        args.collect_samples = 5000
+        args.train_spike_decoder = True
+        args.run_closed_loop = True
+        args.allow_stim = False  # software mode by default
+        args.train_dqn = False  # only re-train teacher if you want
+
     set_seed()
     os.makedirs(args.save_path, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[INFO] Device:", device)
     if args.allow_stim:
         print("!!! WARNING: STIMULATION ENABLED. Ensure approvals and safety BEFORE running on real tissue !!!")
+
+    show_automap_flag = bool(args.show_automap)
 
     # init Doom
     game = DoomGame(); game.load_config(args.config)
@@ -653,7 +701,8 @@ def main():
         if args.collect_spike_data:
             X,y = collect_spike_dataset(game, neurons, teacher, target_samples=args.collect_samples,
                                         max_episodes=50, plans=plans, patterns=patterns, spatial_map=spatial_map,
-                                        allow_stim=args.allow_stim, window=SPIKE_WINDOW, save_path=args.save_path)
+                                        allow_stim=args.allow_stim, window=SPIKE_WINDOW, save_path=args.save_path,
+                                        show_automap_flag=show_automap_flag)
             print("[DATA] Collected:", X.shape, y.shape)
 
         # Train spike decoder
@@ -667,9 +716,15 @@ def main():
                 print("[SPK] dataset not found; collecting now...")
                 X,y = collect_spike_dataset(game, neurons, teacher, target_samples=args.collect_samples,
                                             max_episodes=50, plans=plans, patterns=patterns, spatial_map=spatial_map,
-                                            allow_stim=args.allow_stim, window=SPIKE_WINDOW, save_path=args.save_path)
+                                            allow_stim=args.allow_stim, window=SPIKE_WINDOW, save_path=args.save_path,
+                                            show_automap_flag=show_automap_flag)
             if len(X) < SPIKE_DATA_MIN_SAMPLES:
                 print(f"[SPK] Warning: small dataset ({len(X)} samples). Consider collecting more.")
+            # Simple normalization for stability
+            mu = X.mean(axis=0, keepdims=True)
+            std = X.std(axis=0, keepdims=True) + 1e-6
+            X = (X - mu) / std
+            np.save(os.path.join(args.save_path, "spike_X_norm.npy"), X)
             spike_decoder = train_spike_decoder(X,y,device=device, epochs=SPIKE_DECODER_EPOCHS, save_path=args.save_path)
 
         # Optionally load spike decoder
@@ -695,12 +750,11 @@ def main():
             run_closed_loop_neuron_control(game, neurons, spike_decoder, plans=plans, patterns=patterns,
                                            spatial_map=spatial_map, episodes=args.episodes, window=SPIKE_WINDOW,
                                            allow_stim=args.allow_stim, save_path=args.save_path, device=device,
-                                           online_finetune=args.online_finetune, teacher=teacher)
+                                           online_finetune=args.online_finetune, teacher=teacher,
+                                           show_automap_flag=show_automap_flag)
 
     game.close()
     print("[INFO] All done. Logs saved to:", args.save_path)
 
 if __name__ == "__main__":
     main()
-
-

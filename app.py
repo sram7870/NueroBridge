@@ -1321,17 +1321,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--run-closed-loop", action="store_true")
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--save-path", type=str, default=os.getcwd())
-    p.add_argument("--allow-stim", action="store_true",
-                   help="Enable hardware stimulation (DANGEROUS). Requires explicit confirmation.")
-    p.add_argument("--confirm-stim", action="store_true",
-                   help="Secondary explicit flag required in addition to --allow-stim.")
+    p.add_argument("--allow-stim", action="store_true")
+    p.add_argument("--confirm-stim", action="store_true")
     p.add_argument("--encoding", type=str, choices=["temporal", "rate", "spatial", "hybrid"], default="hybrid")
     p.add_argument("--load-dqn", type=str, default=None)
     p.add_argument("--load-spike-decoder", type=str, default=None)
-    p.add_argument("--online-finetune", action="store_true",
-                   help="Fine-tune spike decoder online during closed-loop using teacher")
-    p.add_argument("--show-automap", action="store_true", help="Display ViZDoom top-down automap for debugging")
-    p.add_argument("--debug-run", action="store_true", help="Quick demo run (no neural decoder).")
+    p.add_argument("--online-finetune", action="store_true")
+    p.add_argument("--show-automap", action="store_true")
+    p.add_argument("--debug-run", action="store_true")
     return p
 
 

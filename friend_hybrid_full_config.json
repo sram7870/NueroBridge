@@ -1,0 +1,51 @@
+{
+  "channel_groups": {
+    "forward": [
+      10,
+      11,
+      12
+    ],
+    "backward": [
+      20
+    ],
+    "left": [
+      40
+    ],
+    "right": [
+      30,
+      31
+    ],
+    "attack": [
+      50
+    ]
+  },
+  "weights": {},
+  "params": {
+    "ticks_per_second": 35,
+    "inertia_len": 6,
+    "ema_alpha": 0.35,
+    "outlier_z": 3.0,
+    "min_spike_threshold": 0.04,
+    "max_intensity": 6,
+    "momentum_decay": 0.82,
+    "reward_lr": 0.02,
+    "penalty_increase": 0.06,
+    "penalty_decay": 0.995,
+    "grid_cell_size": 6.0,
+    "stuck_threshold": 0.15,
+    "max_stuck_ticks": 120,
+    "verbose": true,
+    "dynamic_group_eval_interval": 400,
+    "group_reassign_top_k": 3,
+    "curiosity_bonus": 0.15,
+    "anneal_start_temp": 0.05,
+    "anneal_end_temp": 0.001,
+    "anneal_steps": 10000,
+    "temporal_window": 8,
+    "use_policy_net": true,
+    "policy_lr": 0.0001,
+    "policy_hidden": 64,
+    "policy_update_every": 12,
+    "seed": 1234
+  }
+}

@@ -382,7 +382,7 @@
                     if args.show_logs:
                         print("Reached armor!")
                     game.make_action([0,0,0,0])
-                    time.sleep(1)
+                    time.sleep(3)
                     break
 
         game.close()
@@ -390,3 +390,4 @@
 
     if __name__ == "__main__":
         main()
+
